@@ -7,11 +7,9 @@ import numpy as np
 import json
 import gzip
 import glob
-import copy
 from transformers import XLMRobertaModel, XLMRobertaTokenizerFast
-from transformers import Trainer, TrainingArguments
 from transformers import get_linear_schedule_with_warmup
-from datasets import Dataset, Features, Value, Sequence
+from datasets import Dataset
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from accelerate import Accelerator
@@ -21,7 +19,7 @@ from tqdm.auto import tqdm
 
 # Custom model for regression with partially frozen RoBERTa weights
 class XLMRobertaForRegression(torch.nn.Module):
-    def __init__(self, pretrained_model_name='xlm-roberta-base', num_unfrozen_layers=3):
+    def __init__(self, pretrained_model_name='xlm-roberta-base', num_unfrozen_layers=5):
         super().__init__()
         self.roberta = XLMRobertaModel.from_pretrained(pretrained_model_name)
         self.regression_head = torch.nn.Linear(self.roberta.config.hidden_size, 1)
@@ -146,7 +144,9 @@ def predict_full_text(tokenizer, texts, max_length=512, stride=256):
 
 def main():
     # Initialize accelerator
-    accelerator = Accelerator()
+    accelerator = Accelerator(
+        # dynamo_backend="inductor" # doesn't work on old GPUs
+        )
 
     # Set seed for reproducibility
     set_seed(42)
@@ -169,12 +169,12 @@ def main():
     test_dataset = prepare_sliding_window_dataset(tokenizer, test_texts, test_scores)
 
     # Define training parameters
-    num_epochs = 20
-    batch_size = 16
-    learning_rate = 3e-5
-    weight_decay = 0.01
+    num_epochs = 5
+    batch_size = 8
+    learning_rate = 5e-5
+    weight_decay = 0.005
     num_warmup_steps = 20
-    lambda_reg = 0.1 # regularization strength towards original params
+    lambda_reg = 0.005 # regularization strength towards original params
 
     # Create DataLoaders
     train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=batch_size, collate_fn=collate_fn)
@@ -249,7 +249,7 @@ def main():
               f"Loss: {eval_loss:.4f}, "
               f"MSE: {eval_mse:.4f}, "
               f"MAE: {eval_mae:.4f}, "
-              f"R2: {eval_r2:.4f}")
+              f"R^2: {eval_r2:.4f}")
 
     # Save the model
     accelerator.wait_for_everyone()
