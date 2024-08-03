@@ -35,14 +35,14 @@ def generate_prompt(text):
     """Generate a prompt for the OpenAI model."""
     return (
     "Nedenfor er et ekstrakt af tekst fra en web-side. Vurder tekstens kvalitet ved hjælp af det additive 5-punkts scoringssystem beskrevet nedenfor. Der akkumuleres point baseret på opfyldelsen af hvert kriterium.\n"
-    "Tilføj 1 point for grundlæggende relevans: Teksten indeholder information der er relevant for emnet, selvom den kan indeholde irrelevant indhold. Dette punkt fokuserer udelukkende på tilstedeværelsen af relevant information, uanset kvaliteten eller præsentationen.\n"
-    "Tilføj endnu et point for sammenhæng og struktur: Teksten præsenterer information på en logisk og organiseret måde. Den har en klar struktur med en indledning, hoveddel og konklusion. Dette punkt vurderer tekstens overordnede opbygning og flow, uafhængigt af indholdet.\n"
+    "Tilføj 1 point for grundlæggende relevans: Teksten indeholder information der er relevant for et eller flere konkrete, interessante emner. Dette udelukker spam og andet irrelevant indhold som ofte består af løst sammensatte sætninger uden egentlig information. Dette punkt fokuserer udelukkende på tilstedeværelsen af relevant information, uanset kvaliteten eller præsentationen.\n"
+    "Tilføj endnu et point for sammenhæng og struktur: Teksten præsenterer information på en logisk og organiseret måde. Den har en klar struktur med en indledning, hoveddel og konklusion. Den er formateret på en letlæselig måde, fx anvender den afsnit og paragraffer, eller andre måder at opbryde teksten på. Dette punkt vurderer tekstens overordnede opbygning og flow, uafhængigt af indholdet.\n"
     "Giv et tredje point for sproglig kvalitet: Teksten udviser klar og præcis sprogbrug. Sætninger er velformulerede, grammatisk korrekte, og der bruges et passende ordforråd. Dette punkt fokuserer udelukkende på det sproglige aspekt, uanset indholdet eller strukturen.\n"
     "Giv et fjerde point for dybde og nuancer: Teksten går ud over overfladisk behandling af emnet og udforsker det i dybden. Den præsenterer forskellige perspektiver, understøtter påstande med beviser eller eksempler, og viser en nuanceret forståelse af emnet. Dette punkt vurderer indholdslagets kvalitet, uanset tekstens struktur eller sprogbrug.\n"
     "Giv et femte point for originalitet og indsigt: Teksten bidrager med ny viden, originale ideer eller unikke perspektiver til emnet. Den går ud over at gentage kendt information og demonstrerer kritisk tænkning, analytiske færdigheder eller kreativ problemløsning. Dette punkt fokuserer på tekstens intellektuelle bidrag, uafhængigt af de andre kriterier.\n"
     f"Teksten:\n{text}\n"
     "Efter at have undersøgt teksten:\n"
-    "- Forklar i én kort paragraf din totale score, op til 100 ord.\n"
+    "- Forklar i én kort paragraf din totale score, højst 50 ord.\n"
     "- Konkluder med scoren i formatet: \"Kvalitet: <point>\""
     )
 
