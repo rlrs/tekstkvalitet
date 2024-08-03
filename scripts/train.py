@@ -7,6 +7,7 @@ import numpy as np
 import json
 import gzip
 import glob
+import copy
 from transformers import XLMRobertaModel, XLMRobertaTokenizerFast
 from transformers import Trainer, TrainingArguments
 from transformers import get_linear_schedule_with_warmup
@@ -18,17 +19,25 @@ from accelerate.utils import set_seed
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-# Custom model for regression with frozen RoBERTa weights
+# Custom model for regression with partially frozen RoBERTa weights
 class XLMRobertaForRegression(torch.nn.Module):
-    def __init__(self, pretrained_model_name='xlm-roberta-base'):
+    def __init__(self, pretrained_model_name='xlm-roberta-base', num_unfrozen_layers=3):
         super().__init__()
         self.roberta = XLMRobertaModel.from_pretrained(pretrained_model_name)
         self.regression_head = torch.nn.Linear(self.roberta.config.hidden_size, 1)
-
-        # Freeze the weights of the RoBERTa model
-        for name, param in self.roberta.named_parameters():
-            print(f"Freezing {name}")
+        
+        # Freeze all layers except the top num_unfrozen_layers
+        for param in self.roberta.parameters():
             param.requires_grad = False
+        
+        for param in self.roberta.encoder.layer[-num_unfrozen_layers:].parameters():
+            param.requires_grad = True
+
+        # Store the original parameters for regularization
+        self.original_params = {}
+        for name, param in self.roberta.named_parameters():
+            if param.requires_grad:
+                self.original_params[name] = param.data.clone()
 
     def forward(self, input_ids, attention_mask, labels=None):
         outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
@@ -41,6 +50,13 @@ class XLMRobertaForRegression(torch.nn.Module):
             loss = loss_fct(logits.squeeze(), labels.squeeze())
 
         return (loss, logits) if loss is not None else logits
+
+    def get_param_regularization_loss(self, lambda_reg):
+        reg_loss = 0.0
+        for name, param in self.roberta.named_parameters():
+            if param.requires_grad:
+                reg_loss += torch.sum((param - self.original_params[name]) ** 2)
+        return lambda_reg * reg_loss
 
 # Load data from .jsonl.gz files
 def load_data(file_pattern):
@@ -146,25 +162,32 @@ def main():
     scores = np.array(scores) / 5.0
 
     # Split data into train and test sets
-    train_texts, test_texts, train_scores, test_scores = train_test_split(texts[:100], scores[:100], test_size=0.2, random_state=42)
+    train_texts, test_texts, train_scores, test_scores = train_test_split(texts, scores, test_size=0.2, random_state=42)
 
     # Prepare train and test datasets
     train_dataset = prepare_sliding_window_dataset(tokenizer, train_texts, train_scores)
     test_dataset = prepare_sliding_window_dataset(tokenizer, test_texts, test_scores)
 
     # Define training parameters
-    num_epochs = 5
-    batch_size = 8
+    num_epochs = 20
+    batch_size = 16
     learning_rate = 3e-5
     weight_decay = 0.01
     num_warmup_steps = 20
+    lambda_reg = 0.1 # regularization strength towards original params
 
     # Create DataLoaders
     train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=batch_size, collate_fn=collate_fn)
     eval_dataloader = DataLoader(test_dataset, batch_size=batch_size, collate_fn=collate_fn)
 
     # Define optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": [p for n, p in model.roberta.named_parameters() if p.requires_grad], "lr": learning_rate},
+            {"params": model.regression_head.parameters(), "lr": learning_rate * 10}
+        ],
+        weight_decay=weight_decay
+    )
 
     # Define learning rate scheduler
     num_update_steps_per_epoch = len(train_dataloader)
@@ -180,6 +203,11 @@ def main():
         model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
     )
 
+    # Move original parameters to the correct device after prepare
+    for name, param in model.roberta.named_parameters():
+        if param.requires_grad:
+            model.original_params[name] = model.original_params[name].to(param.device)
+
     # Training loop
     epoch_pbar = tqdm(range(num_epochs), desc="Epochs", position=0)
     for epoch in epoch_pbar:
@@ -188,11 +216,13 @@ def main():
         for batch in batch_pbar:
             outputs = model(**batch)
             loss = outputs[0]
-            accelerator.backward(loss)
+            reg_loss = model.get_param_regularization_loss(lambda_reg)
+            total_loss = loss + reg_loss
+            accelerator.backward(total_loss)
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
-            batch_pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+            batch_pbar.set_postfix({"loss": f"{loss.item():.4f}", "reg_loss": f"{reg_loss.item():.4f}"})
 
         # Evaluation
         model.eval()
