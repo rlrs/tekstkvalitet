@@ -10,6 +10,9 @@ dependencies = [
     "accelerate>=0.33.0",
     "tqdm>=4.66.4",
     "scikit-learn>=1.5.1",
+    "openai>=1.38.0",
+    "tiktoken>=0.7.0",
+    "python-dotenv>=1.0.1",
 ]
 readme = "README.md"
 requires-python = ">= 3.8"
