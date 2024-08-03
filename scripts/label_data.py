@@ -6,19 +6,36 @@ import argparse
 import openai
 from json import loads, dumps
 import gzip
-import pandas as pd
 from tqdm import tqdm
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import hashlib
 import re
 import glob
+import sqlite3
 import tiktoken
+import json
+import queue
+import threading
 from dotenv import load_dotenv
 load_dotenv()
 
 client = openai.Client()
+
+def create_database(db_path):
+    """Create SQLite database and table for storing evaluated texts with additional fields."""
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS evaluated_texts
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  text TEXT UNIQUE,
+                  quality_explanation TEXT,
+                  quality_score INTEGER,
+                  metadata TEXT,
+                  evaluation_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+    conn.commit()
+    conn.close()
+
 
 def load_data_from_jsonl_gz(file_path):
     """Load data from a gzipped JSONL file."""
@@ -168,75 +185,97 @@ def find_split_point(text, encoder, max_tokens):
     return len(encoder.decode(tokens[:max_tokens]))
 
 
-def process_batch(batch, existing_evaluations, encoder, max_tokens):
-    """Process a batch of texts."""
-    results = []
+def process_batch(batch, write_queue, encoder, max_tokens):
+    """Process a batch of texts and put results in the write queue."""
     for item in batch:
         text = item['text']
-        if text in existing_evaluations:
-            results.append((item, existing_evaluations[text]))
+        chunks = split_text(text, encoder, max_tokens)
+        if len(chunks) == 1:
+            evaluation = get_quality_evaluation(chunks[0])
         else:
-            chunks = split_text(text, encoder, max_tokens)
-            if len(chunks) == 1:
-                evaluation = get_quality_evaluation(chunks[0])
-                results.append((item, evaluation))
+            chunk_evaluations = [get_quality_evaluation(chunk) for chunk in chunks]
+            scores = [int(eval['score']) for eval in chunk_evaluations if eval and eval['score']]
+            explanations = [eval['explanation'] for eval in chunk_evaluations if eval and eval['explanation']]
+            if scores:
+                avg_score = sum(scores) / len(scores)
+                combined_explanation = " ".join(explanations)
+                evaluation = {
+                    "explanation": f"Combined evaluation of {len(chunks)} chunks: {combined_explanation}",
+                    "score": str(round(avg_score))
+                }
             else:
-                chunk_evaluations = [get_quality_evaluation(chunk) for chunk in chunks]
-                # Aggregate scores and explanations
-                scores = [int(eval['score']) for eval in chunk_evaluations if eval and eval['score']]
-                explanations = [eval['explanation'] for eval in chunk_evaluations if eval and eval['explanation']]
-                if scores:
-                    avg_score = sum(scores) / len(scores)
-                    combined_explanation = " ".join(explanations)
-                    evaluation = {
-                        "explanation": f"Combined evaluation of {len(chunks)} chunks: {combined_explanation}",
-                        "score": str(round(avg_score))
-                    }
-                else:
-                    evaluation = None
-                results.append((item, evaluation))
-    return results
+                evaluation = None
+        
+        write_queue.put((text, evaluation, item.get('metadata', {})))
+
+def db_writer(db_path, write_queue, total_items):
+    """Write evaluation results to the database from a queue."""
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    
+    with tqdm(total=total_items, desc="Writing to database") as pbar:
+        while True:
+            item = write_queue.get()
+            if item is None:  # None is our signal to stop
+                break
+            
+            text, evaluation, metadata = item
+            if evaluation:
+                c.execute("""INSERT OR REPLACE INTO evaluated_texts 
+                             (text, quality_explanation, quality_score, metadata) 
+                             VALUES (?, ?, ?, ?)""",
+                          (text, evaluation['explanation'], evaluation['score'], json.dumps(metadata)))
+                conn.commit()
+            
+            pbar.update(1)
+            write_queue.task_done()
+    
+    conn.close()
 
 
-def process_jsonl_gz_file(file_path, batch_size, max_workers):
-    """Process a single gzipped JSONL file and write results to a new file."""
-    output_file_path = file_path.replace('.jsonl.gz', '_evaluated.jsonl.gz')
-    existing_evaluations = load_existing_evaluations(output_file_path)
+def process_jsonl_gz_file(file_path, db_path, batch_size, max_workers):
+    """Process a single gzipped JSONL file and store results in SQLite database."""
+    encoder = tiktoken.encoding_for_model("gpt-4-1106-preview")
+    max_tokens = 8192  # Maximum tokens for GPT-4 Turbo
 
-    encoder = tiktoken.encoding_for_model("gpt-4o")
-    max_tokens = 120000 # can you get this automatically?
+    data = list(load_data_from_jsonl_gz(file_path))
+    total_items = len(data)
 
-    with gzip.open(output_file_path, 'wt', encoding='utf-8') as out_file:
-        data = list(load_data_from_jsonl_gz(file_path))
+    write_queue = queue.Queue()
+    
+    # Start the database writer thread
+    db_writer_thread = threading.Thread(target=db_writer, args=(db_path, write_queue, total_items))
+    db_writer_thread.start()
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
-            for batch in chunk_list(data, batch_size):
-                futures.append(executor.submit(process_batch, batch, existing_evaluations, encoder, max_tokens))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        for batch in chunk_list(data, batch_size):
+            futures.append(executor.submit(process_batch, batch, write_queue, encoder, max_tokens))
 
-            for future in tqdm(as_completed(futures), total=len(futures), desc=f"Processing {os.path.basename(file_path)}"):
-                batch_results = future.result()
-                for item, evaluation in batch_results:
-                    if evaluation:
-                        item["quality_explanation"] = evaluation["explanation"]
-                        item["quality_score"] = evaluation["score"]
-                    else:
-                        item["quality_explanation"] = "Evaluation failed"
-                        item["quality_score"] = None
-                    out_file.write(dumps(item) + '\n')
+        for future in tqdm(as_completed(futures), total=len(futures), desc=f"Processing {os.path.basename(file_path)}"):
+            future.result()
+
+    # Signal the db_writer to stop
+    write_queue.put(None)
+    db_writer_thread.join()
 
 
 def main(args):
+    # Create SQLite database
+    db_path = os.path.join(args.output, "evaluated_texts.db")
+    create_database(db_path)
+
     # Get input files
     input_files = glob.glob(os.path.join(args.input, "*.jsonl.gz"))
 
     # Process each gzipped JSONL file
     for file in input_files:
-        process_jsonl_gz_file(file, args.batch_size, args.max_workers)
+        process_jsonl_gz_file(file, db_path, args.batch_size, args.max_workers)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate quality evaluations for text data using OpenAI API")
     parser.add_argument("--input", type=str, required=True, help="Directory of input .jsonl.gz files")
+    parser.add_argument("--output", type=str, required=True, help="Directory for output SQLite database")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for processing")
     parser.add_argument("--max_workers", type=int, default=5, help="Maximum number of concurrent API calls")
 
