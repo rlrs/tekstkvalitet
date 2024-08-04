@@ -96,20 +96,6 @@ def get_quality_evaluation(text: str, model: str, max_retries: int = 3) -> dict[
 
     return None
 
-def load_existing_evaluations(file_path: str):
-    """Load existing evaluations from a file."""
-    evaluations = {}
-    if os.path.exists(file_path):
-        with gzip.open(file_path, 'rt', encoding='utf-8') as f:
-            for line in f:
-                data = loads(line)
-                if 'text' in data and 'quality_score' in data and 'quality_explanation' in data:
-                    evaluations[data['text']] = {
-                        'score': data['quality_score'],
-                        'explanation': data['quality_explanation']
-                    }
-    return evaluations
-
 def split_text(text: str, encoder, max_tokens: int):
     """Split text into chunks that don't exceed max_tokens, preserving formatting and creating even-sized chunks."""
     # Encode the entire text to get total tokens
