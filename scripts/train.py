@@ -4,14 +4,13 @@ This is the third and final stage of the pipeline.
 """
 import torch
 import numpy as np
-import json
-import gzip
-import glob
+import sqlite3
 from transformers import XLMRobertaModel, XLMRobertaTokenizerFast
 from transformers import get_linear_schedule_with_warmup
 from datasets import Dataset
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, cohen_kappa_score
+from scipy.stats import spearmanr
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from torch.utils.data import DataLoader
@@ -56,15 +55,16 @@ class XLMRobertaForRegression(torch.nn.Module):
                 reg_loss += torch.sum((param - self.original_params[name]) ** 2)
         return lambda_reg * reg_loss
 
-# Load data from .jsonl.gz files
-def load_data(file_pattern):
+# Load data from the SQLite db
+def load_data(db_path: str):
     texts, scores = [], []
-    for filename in glob.glob(file_pattern):
-        with gzip.open(filename, 'rt', encoding='utf-8') as f:
-            for line in f:
-                data = json.loads(line)
-                texts.append(data['text'])
-                scores.append(int(data['quality_score']))
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute("SELECT text, quality_score FROM evaluated_texts")
+    for row in c.fetchall():
+        texts.append(row[0])
+        scores.append(row[1])
+    conn.close()
     return texts, scores
 
 def prepare_sliding_window_dataset(tokenizer, texts, scores, max_length=512, stride=256):
@@ -142,6 +142,74 @@ def predict_full_text(tokenizer, texts, max_length=512, stride=256):
 
     return all_predictions
 
+def evaluate_model(model, eval_dataloader):
+    """
+    Calculate evaluation metrics for the model.
+    Metrics:
+    - MAE provides an intuitive measure of average error.
+    - Weighted Kappa accounts for the ordinal nature of your data.
+    - Spearman's correlation shows how well your model ranks the texts.
+    - R² gives you an idea of how much variance your model explains.
+    - Macro-MAE helps you understand if your model performs consistently across all score levels.
+    If MAE is low but Kappa is also low, it might indicate that your model is making 
+      small but systematically incorrect predictions.
+    If Spearman's correlation is high but MAE is not great, it suggests 
+      that your model ranks texts well but might need calibration for absolute predictions.
+    Comparing Macro-MAE to MAE can reveal if your model performs poorly on certain score levels.
+    """
+    model.eval()
+    eval_loss = 0
+    eval_preds = []
+    eval_labels = []
+    
+    eval_pbar = tqdm(eval_dataloader, desc="Evaluating", leave=False, position=2)
+    
+    for batch in eval_pbar:
+        with torch.no_grad():
+            outputs = model(**batch)
+        loss, logits = outputs[:2]
+        eval_loss += loss.item()
+        eval_preds.extend(logits.squeeze().tolist())
+        eval_labels.extend(batch["labels"].squeeze().tolist())
+
+    eval_loss /= len(eval_dataloader)
+    eval_preds = np.array(eval_preds) * 5  # Denormalize
+    eval_labels = np.array(eval_labels) * 5  # Denormalize
+    
+    # Round predictions to nearest integer for classification metrics
+    eval_preds_rounded = np.round(eval_preds).astype(int)
+    eval_labels_rounded = np.round(eval_labels).astype(int)
+    
+    # Regression metrics
+    mae = mean_absolute_error(eval_labels, eval_preds)
+    mse = mean_squared_error(eval_labels, eval_preds)
+    r2 = r2_score(eval_labels, eval_preds)
+    
+    # Classification metrics
+    weights = 'quadratic'  # Penalizes larger disagreements more
+    kappa = cohen_kappa_score(eval_labels_rounded, eval_preds_rounded, weights=weights)
+    
+    # Spearman's Rank Correlation (works with continuous values)
+    spearman_corr, _ = spearmanr(eval_labels, eval_preds)
+    
+    # Macro-averaged MAE
+    unique_labels = np.unique(eval_labels_rounded)
+    macro_mae = np.mean([
+        mean_absolute_error(eval_labels[eval_labels_rounded == label], eval_preds[eval_labels_rounded == label])
+        for label in unique_labels
+    ])
+    
+    return {
+        "Loss": eval_loss,
+        "MAE": mae,
+        "MSE": mse,
+        "R2": r2,
+        "Weighted Kappa": kappa,
+        "Spearman Correlation": spearman_corr,
+        "Macro-MAE": macro_mae
+    }
+
+
 def main():
     # Initialize accelerator
     accelerator = Accelerator(
@@ -156,7 +224,7 @@ def main():
     tokenizer = XLMRobertaTokenizerFast.from_pretrained('xlm-roberta-base')
 
     # Load all data
-    texts, scores = load_data('../quality_filtering/output/*_evaluated.jsonl.gz')
+    texts, scores = load_data('evaluated_texts.db')
 
     # Normalize scores to [0, 1] range
     scores = np.array(scores) / 5.0
@@ -169,16 +237,18 @@ def main():
     test_dataset = prepare_sliding_window_dataset(tokenizer, test_texts, test_scores)
 
     # Define training parameters
-    num_epochs = 5
-    batch_size = 8
+    num_epochs = 2
+    train_batch_size = 8
+    eval_batch_size = 32
     learning_rate = 5e-5
     weight_decay = 0.005
     num_warmup_steps = 20
     lambda_reg = 0.005 # regularization strength towards original params
+    eval_steps = 500
 
     # Create DataLoaders
-    train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=batch_size, collate_fn=collate_fn)
-    eval_dataloader = DataLoader(test_dataset, batch_size=batch_size, collate_fn=collate_fn)
+    train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=train_batch_size, collate_fn=collate_fn)
+    eval_dataloader = DataLoader(test_dataset, batch_size=eval_batch_size, collate_fn=collate_fn)
 
     # Define optimizer
     optimizer = torch.optim.AdamW(
@@ -208,12 +278,15 @@ def main():
         if param.requires_grad:
             model.original_params[name] = model.original_params[name].to(param.device)
 
-    # Training loop
+    # Training loop with hierarchical progress bars
+    global_step = 0
+    best_mae = float('inf')
     epoch_pbar = tqdm(range(num_epochs), desc="Epochs", position=0)
     for epoch in epoch_pbar:
         model.train()
-        batch_pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1} - Training", leave=False, position=1)
-        for batch in batch_pbar:
+        step_pbar = tqdm(range(num_update_steps_per_epoch), desc=f"Epoch {epoch+1}", leave=False, position=1)
+        for _ in step_pbar:
+            batch = next(iter(train_dataloader))
             outputs = model(**batch)
             loss = outputs[0]
             reg_loss = model.get_param_regularization_loss(lambda_reg)
@@ -222,41 +295,53 @@ def main():
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
-            batch_pbar.set_postfix({"loss": f"{loss.item():.4f}", "reg_loss": f"{reg_loss.item():.4f}"})
+            
+            global_step += 1
 
-        # Evaluation
-        model.eval()
-        eval_loss = 0
-        eval_preds = []
-        eval_labels = []
-        eval_pbar = tqdm(eval_dataloader, desc=f"Epoch {epoch+1} - Evaluation", leave=False, position=1)
-        for batch in eval_pbar:
-            with torch.no_grad():
-                outputs = model(**batch)
-            loss, logits = outputs[:2]
-            eval_loss += loss.item()
-            eval_preds.extend(logits.squeeze().tolist())
-            eval_labels.extend(batch["labels"].squeeze().tolist())
+            if global_step % eval_steps == 0:
+                metrics = evaluate_model(model, eval_dataloader)
+                
+                step_pbar.set_postfix({
+                    "Loss": f"{metrics['Loss']:.4f}",
+                    "MAE": f"{metrics['MAE']:.4f}",
+                    "R2": f"{metrics['R2']:.4f}",
+                    "Kappa": f"{metrics['Weighted Kappa']:.4f}",
+                    "Spearman": f"{metrics['Spearman Correlation']:.4f}"
+                })
 
-        eval_loss /= len(eval_dataloader)
-        eval_preds = np.array(eval_preds) * 5  # Denormalize
-        eval_labels = np.array(eval_labels) * 5  # Denormalize
-        eval_mse = mean_squared_error(eval_labels, eval_preds)
-        eval_mae = mean_absolute_error(eval_labels, eval_preds)
-        eval_r2 = r2_score(eval_labels, eval_preds)
+                # Print detailed metrics
+                print(f"\nEpoch {epoch+1}, Step {global_step} Evaluation Metrics:")
+                for metric, value in metrics.items():
+                    print(f"{metric}: {value:.4f}")
 
-        accelerator.print(f"Epoch {epoch+1}: "
-              f"Loss: {eval_loss:.4f}, "
-              f"MSE: {eval_mse:.4f}, "
-              f"MAE: {eval_mae:.4f}, "
-              f"R^2: {eval_r2:.4f}")
+                # Save the best model
+                if metrics['MAE'] < best_mae:
+                    best_mae = metrics['MAE']
+                    accelerator.wait_for_everyone()
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    accelerator.save(unwrapped_model.state_dict(), f"./xlm-roberta-quality-regressor-best.pt")
+                    print(f"New best model saved with MAE: {best_mae:.4f}")
 
-    # Save the model
+        # Update epoch progress bar with the last evaluation metrics
+        epoch_pbar.set_postfix({
+            "MAE": f"{metrics['MAE']:.4f}",
+            "R2": f"{metrics['R2']:.4f}",
+            "Kappa": f"{metrics['Weighted Kappa']:.4f}"
+        })
+
+    # Final evaluation
+    print("\nPerforming final evaluation...")
+    final_metrics = evaluate_model(model, eval_dataloader, accelerator)
+    print("\nFinal Evaluation Metrics:")
+    for metric, value in final_metrics.items():
+        print(f"{metric}: {value:.4f}")
+
+    # Save the final model
     accelerator.wait_for_everyone()
     unwrapped_model = accelerator.unwrap_model(model)
-    accelerator.save(unwrapped_model.state_dict(), "./xlm-roberta-quality-regressor.pt")
+    accelerator.save(unwrapped_model.state_dict(), "./xlm-roberta-quality-regressor-final.pt")
     if accelerator.is_main_process:
-        tokenizer.save_pretrained("./xlm-roberta-quality-regressor")
+        tokenizer.save_pretrained("./xlm-roberta-quality-regressor-final")
 
 if __name__ == "__main__":
     main()
