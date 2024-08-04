@@ -24,7 +24,7 @@ nltk.download('punkt')
 
 INPUT_BASE_DIR = "/work/dfm-data/pre-training/"
 INPUT_DATASETS = ["colossal_oscar_1_0", "nordjylland_news", "lexdk", "eur-lex-sum-da", "dagw-hest"]
-LIMITS = 1000*np.array([1, 0.1, 0.2, 0.02, 0.02])
+LIMITS = 5000*np.array([1, 0.1, 0.2, 0.02, 0.02])
 MAIN_OUTPUT_PATH = "/work/RasmusLarsen#5473/quality_filtering"
 FILTER_OUTPUT_PATH = f"{MAIN_OUTPUT_PATH}/"
 
