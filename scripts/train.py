@@ -16,44 +16,7 @@ from accelerate.utils import set_seed
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-# Custom model for regression with partially frozen RoBERTa weights
-class XLMRobertaForRegression(torch.nn.Module):
-    def __init__(self, pretrained_model_name='xlm-roberta-base', num_unfrozen_layers=5):
-        super().__init__()
-        self.roberta = XLMRobertaModel.from_pretrained(pretrained_model_name)
-        self.regression_head = torch.nn.Linear(self.roberta.config.hidden_size, 1)
-        
-        # Freeze all layers except the top num_unfrozen_layers
-        for param in self.roberta.parameters():
-            param.requires_grad = False
-        
-        for param in self.roberta.encoder.layer[-num_unfrozen_layers:].parameters():
-            param.requires_grad = True
-
-        # Store the original parameters for regularization
-        self.original_params = {}
-        for name, param in self.roberta.named_parameters():
-            if param.requires_grad:
-                self.original_params[name] = param.data.clone()
-
-    def forward(self, input_ids, attention_mask, labels=None):
-        outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
-        cls_output = outputs.last_hidden_state[:, 0, :]  # Get the [CLS] token output
-        logits = self.regression_head(cls_output)
-
-        loss = None
-        if labels is not None:
-            loss_fct = torch.nn.MSELoss()
-            loss = loss_fct(logits.squeeze(), labels.squeeze())
-
-        return (loss, logits) if loss is not None else logits
-
-    def get_param_regularization_loss(self, lambda_reg):
-        reg_loss = 0.0
-        for name, param in self.roberta.named_parameters():
-            if param.requires_grad:
-                reg_loss += torch.sum((param - self.original_params[name]) ** 2)
-        return lambda_reg * reg_loss
+from model import XLMRobertaForRegression
 
 # Load data from the SQLite db
 def load_data(db_path: str):
@@ -220,7 +183,7 @@ def main():
     set_seed(42)
 
     # Load pre-trained model and tokenizer
-    model = XLMRobertaForRegression()
+    model = XLMRobertaForRegression.from_pretrained('xlm-roberta-base', num_unfrozen_layers=1)
     tokenizer = XLMRobertaTokenizerFast.from_pretrained('xlm-roberta-base')
 
     # Load all data
@@ -240,7 +203,7 @@ def main():
     num_epochs = 2
     train_batch_size = 8
     eval_batch_size = 32
-    learning_rate = 5e-5
+    learning_rate = 7e-5
     weight_decay = 0.005
     num_warmup_steps = 20
     lambda_reg = 0.005 # regularization strength towards original params
@@ -295,19 +258,16 @@ def main():
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
+
+            step_pbar.set_postfix({
+                    "Train loss": f"{loss.item():.4f}",
+                    "Reg loss": f"{reg_loss.item():.4f}",
+                })
             
             global_step += 1
 
             if global_step % eval_steps == 0:
                 metrics = evaluate_model(model, eval_dataloader)
-                
-                step_pbar.set_postfix({
-                    "Loss": f"{metrics['Loss']:.4f}",
-                    "MAE": f"{metrics['MAE']:.4f}",
-                    "R2": f"{metrics['R2']:.4f}",
-                    "Kappa": f"{metrics['Weighted Kappa']:.4f}",
-                    "Spearman": f"{metrics['Spearman Correlation']:.4f}"
-                })
 
                 # Print detailed metrics
                 print(f"\nEpoch {epoch+1}, Step {global_step} Evaluation Metrics:")
@@ -319,29 +279,34 @@ def main():
                     best_mae = metrics['MAE']
                     accelerator.wait_for_everyone()
                     unwrapped_model = accelerator.unwrap_model(model)
-                    accelerator.save(unwrapped_model.state_dict(), f"./xlm-roberta-quality-regressor-best.pt")
+                    accelerator.save(unwrapped_model.state_dict(), "./model-best.safetensors", safe_serialization=True)
                     print(f"New best model saved with MAE: {best_mae:.4f}")
-
-        # Update epoch progress bar with the last evaluation metrics
-        epoch_pbar.set_postfix({
-            "MAE": f"{metrics['MAE']:.4f}",
-            "R2": f"{metrics['R2']:.4f}",
-            "Kappa": f"{metrics['Weighted Kappa']:.4f}"
-        })
 
     # Final evaluation
     print("\nPerforming final evaluation...")
-    final_metrics = evaluate_model(model, eval_dataloader, accelerator)
+    final_metrics = evaluate_model(model, eval_dataloader)
     print("\nFinal Evaluation Metrics:")
     for metric, value in final_metrics.items():
         print(f"{metric}: {value:.4f}")
 
-    # Save the final model
-    accelerator.wait_for_everyone()
+    # Save the final model in Hugging Face format
+    print("\nSaving the final model...")
+    output_dir = "./model-final"
     unwrapped_model = accelerator.unwrap_model(model)
-    accelerator.save(unwrapped_model.state_dict(), "./xlm-roberta-quality-regressor-final.pt")
-    if accelerator.is_main_process:
-        tokenizer.save_pretrained("./xlm-roberta-quality-regressor-final")
+    unwrapped_model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
+
+    # Save the model configuration with custom code information
+    config = unwrapped_model.config
+    config.num_labels = 1
+    config.problem_type = "regression"
+    config.auto_map = {"AutoModel": "model.XLMRobertaForRegression"}
+    config.custom_objects = {"create_model": "model.create_model"}
+    config.save_pretrained(output_dir)
+
+    # Save the custom model code
+    import shutil
+    shutil.copy("model.py", f"{output_dir}/model.py")
 
 if __name__ == "__main__":
     main()
