@@ -2,21 +2,25 @@
 Train the quality classifier.
 This is the third and final stage of the pipeline.
 """
-import torch
-import numpy as np
 import sqlite3
-from transformers import XLMRobertaModel, XLMRobertaTokenizerFast
-from transformers import get_linear_schedule_with_warmup
-from datasets import Dataset
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, cohen_kappa_score
-from scipy.stats import spearmanr
+
+import numpy as np
+import torch
+import wandb
 from accelerate import Accelerator
 from accelerate.utils import set_seed
+from datasets import Dataset
+from scipy.stats import spearmanr
+from sklearn.metrics import (cohen_kappa_score, mean_absolute_error,
+                             mean_squared_error, r2_score)
+from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
+from transformers import (XLMRobertaModel, XLMRobertaTokenizerFast,
+                          get_linear_schedule_with_warmup)
 
 from model import XLMRobertaForRegression
+
 
 # Load data from the SQLite db
 def load_data(db_path: str):
@@ -174,7 +178,8 @@ def evaluate_model(model, eval_dataloader):
 
 
 def main():
-    # Initialize accelerator
+    wandb.init(project="tekstkvalitet", name="xlm-roberta-base")
+
     accelerator = Accelerator(
         # dynamo_backend="inductor" # doesn't work on old GPUs
         )
@@ -193,7 +198,7 @@ def main():
     scores = np.array(scores) / 5.0
 
     # Split data into train and test sets
-    train_texts, test_texts, train_scores, test_scores = train_test_split(texts, scores, test_size=0.2, random_state=42)
+    train_texts, test_texts, train_scores, test_scores = train_test_split(texts, scores, test_size=0.02, random_state=42)
 
     # Prepare train and test datasets
     train_dataset = prepare_sliding_window_dataset(tokenizer, train_texts, train_scores)
@@ -201,13 +206,25 @@ def main():
 
     # Define training parameters
     num_epochs = 2
-    train_batch_size = 8
-    eval_batch_size = 32
-    learning_rate = 7e-5
-    weight_decay = 0.005
-    num_warmup_steps = 20
-    lambda_reg = 0.005 # regularization strength towards original params
+    train_batch_size = 16
+    eval_batch_size = 64
+    learning_rate = 1e-4
+    weight_decay = 0.01
+    num_warmup_steps = 50
+    lambda_reg = 0.01 # regularization strength towards original params
     eval_steps = 500
+
+    # Log hyperparameters to wandb
+    wandb.config.update({
+        "num_epochs": num_epochs,
+        "train_batch_size": train_batch_size,
+        "eval_batch_size": eval_batch_size,
+        "learning_rate": learning_rate,
+        "weight_decay": weight_decay,
+        "num_warmup_steps": num_warmup_steps,
+        "lambda_reg": lambda_reg,
+        "eval_steps": eval_steps
+    })
 
     # Create DataLoaders
     train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=train_batch_size, collate_fn=collate_fn)
@@ -264,6 +281,14 @@ def main():
                     "Reg loss": f"{reg_loss.item():.4f}",
                 })
             
+            # Log training metrics to wandb
+            wandb.log({
+                "train_loss": loss.item(),
+                "reg_loss": reg_loss.item(),
+                "total_loss": total_loss.item(),
+                "learning_rate": lr_scheduler.get_last_lr()[0]
+            }, step=global_step)
+            
             global_step += 1
 
             if global_step % eval_steps == 0:
@@ -274,6 +299,9 @@ def main():
                 for metric, value in metrics.items():
                     print(f"{metric}: {value:.4f}")
 
+                # Log evaluation metrics to wandb
+                wandb.log(metrics, step=global_step)
+
                 # Save the best model
                 if metrics['MAE'] < best_mae:
                     best_mae = metrics['MAE']
@@ -281,6 +309,7 @@ def main():
                     unwrapped_model = accelerator.unwrap_model(model)
                     accelerator.save(unwrapped_model.state_dict(), "./model-best.safetensors", safe_serialization=True)
                     print(f"New best model saved with MAE: {best_mae:.4f}")
+                    wandb.log({"best_mae": best_mae}, step=global_step)
 
     # Final evaluation
     print("\nPerforming final evaluation...")
@@ -288,6 +317,9 @@ def main():
     print("\nFinal Evaluation Metrics:")
     for metric, value in final_metrics.items():
         print(f"{metric}: {value:.4f}")
+
+    # Log final metrics to wandb
+    wandb.log(final_metrics, step=global_step)
 
     # Save the final model in Hugging Face format
     print("\nSaving the final model...")
